@@ -75,8 +75,7 @@ def estimate_dynamic_mu(
             autoregressive=ar,
             exog=exog,
             mle_regression=mle_regression,
-            stochastic_level=True,
-            irregular = True
+            
         )
 
         # 3) fit → 내부에서 필터 실행
@@ -96,7 +95,7 @@ def estimate_dynamic_mu(
 
 
 
-
+'''
 def shrink_mean(
     mu_df: pd.DataFrame,
     var_df: pd.DataFrame | None = None,
@@ -139,7 +138,54 @@ def shrink_mean(
         out.iloc[t] = (1 - lam_opt) * mu_t + lam_opt * mu_bar
 
     return out
+'''
+def shrink_mean(
+    mu_df: pd.DataFrame,
+    var_df: pd.DataFrame | None = None,
+    lam: float = 0.0,
+    method: str = 'manual'
+) -> pd.DataFrame:
+    """
+    mu_df  : T×N 예상 수익(칼만 필터로 추정된 μ)
+    var_df : T×N posterior state covariance (P_{i,t|t} 대각 성분)
+    lam    : manual 모드에서 쓰는 λ
+    method : 'manual' 또는 'auto'
+    """
+    # ───────────────────────────────────────── manual 모드 ─────
+    if method == 'manual':
+        mean_s = mu_df.mean(axis=1)
+        return mu_df.mul(1 - lam, axis=0).add(mean_s.mul(lam), axis=0)
 
+    # ───────────────────────────────────────── auto 모드 ──────
+    if var_df is None:
+        raise ValueError("method='auto'일 때는 var_df를 반드시 넘겨주세요.")
+
+    # 인덱스·칼럼 정렬
+    var_df = var_df.reindex(mu_df.index)[mu_df.columns]
+
+    T, N = mu_df.shape
+    out  = pd.DataFrame(index=mu_df.index, columns=mu_df.columns, dtype=float)
+
+    for t in range(T):
+        mu_t   = mu_df.iloc[t]
+        mu_bar = mu_t.mean()
+    
+        # --- 1) 자산별 표준편차 (float 형 보장)
+        var_t_series = var_df.iloc[t].astype(float)          # ← 핵심 수정
+        sigma = np.sqrt(var_t_series.clip(lower=1e-12))      # 0 방지
+    
+        # --- 2) 표준화
+        z      = (mu_t - mu_bar) / sigma
+        z2_sum = max((z ** 2).sum(), 1e-6)
+    
+        # --- 3) Stein λ
+        lam_opt = max(0.0, 1 - (N - 3) / z2_sum)
+    
+        # --- 4) 복원 후 수축
+        out.iloc[t] = mu_bar + lam_opt * (mu_t - mu_bar)
+
+
+    return out
 
 
 
@@ -401,23 +447,21 @@ tickers = ['XLE',  # 에너지 (Energy)
            'XLV',  # 헬스케어 (Healthcare)
            'XLF',  # 금융 (Financials)
            'XLK',  # 정보기술 (Information Technology)
+           'GDX'   # 금채굴 (Gold Miner)
                ] 
 
 
 
 #tickers = ['QQQ','GLD']
 
-prices = download_prices(tickers, '2000-01-01', '2025-12-31')
+prices = download_prices(tickers, '1970-01-01', '2025-12-31')
 
 
-log_returns = compute_log_returns(prices, subtract_rf=False, freq='daily')
+log_returns = compute_log_returns(prices, subtract_rf=True, freq='daily',rf_code='DGS3MO')
 
-mu_df, var_df, resu = estimate_dynamic_mu(log_returns, ar=False)
-
-mu_df = subtract_risk_free_from_mu(mu_df, rf_code='DGS10', freq='daily')
+mu_df, var_df, resu = estimate_dynamic_mu(log_returns)
 
 
-resu['XLB'].summary()
 
 mu_shrunk = shrink_mean(mu_df, var_df=var_df, method='auto')
 
@@ -428,32 +472,33 @@ mu_shrunk= mu_shrunk.dropna()
 
 
 # 3. 확장 DCC-GARCH 공분산
-dcc_cov_series = rolling_dcc_garch(log_returns, window=500, step=25, dist='t')
+#dcc_cov_series = rolling_dcc_garch(log_returns, window=500, step=25, dist='t')
 
 # 4. mu_shrunk와 날짜 맞춤
-mu_for_opt = mu_shrunk.loc[dcc_cov_series.index]
+#mu_for_opt = mu_shrunk.loc[dcc_cov_series.index]
 
 cov_series = ewma_cov_with_initial_sample(log_returns, lam=0.94)
 
 
-#sharpe_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='sharpe', ridge= 0.2)
-#kelly_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='kelly', ridge= 0.0)
+sharpe_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='sharpe', ridge= 0.1)
+kelly_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='kelly', ridge= 0.0)
 
 # 5. Kelly / Sharpe 최적화
-sharpe_weights_dcc = rolling_portfolio_weights(mu_for_opt, list(dcc_cov_series), objective='sharpe', ridge=0.2)
-
+#sharpe_weights_dcc = rolling_portfolio_weights(mu_for_opt, list(dcc_cov_series), objective='sharpe', ridge=0.1)
 
 import bt
 from bt.algos import Or, RunOnce, RunIfOutOfBounds
 
-# 1. 날짜 정렬 일치
-common_idx = prices.index.intersection(sharpe_weights_dcc.index)
+# 1. Sharpe 전략 데이터 준비
+common_idx = prices.index.intersection(sharpe_weights.index)
 prices_bt = prices.loc[common_idx]
-weights_bt = sharpe_weights_dcc.loc[common_idx]
+weights_bt = sharpe_weights.loc[common_idx]
 
-# 전략 백테스트
-strategy_test = bt.Strategy(
-    'My Sharpe Strategy',
+# ------------------------
+# Sharpe 기반 전략 정의
+# ------------------------
+strategy_sharpe = bt.Strategy(
+    'Sharpe_Strategy',
     [
         bt.algos.WeighTarget(weights_bt),
         Or([
@@ -463,31 +508,51 @@ strategy_test = bt.Strategy(
         bt.algos.Rebalance()
     ]
 )
-test_bt = bt.Backtest(strategy_test, prices_bt)
+test_bt = bt.Backtest(strategy_sharpe, prices_bt)
 
-# 1. SPY 데이터 다운로드 (Series → DataFrame 변환)
-benchmark_price = bt.get('SPY', start=prices_bt.index[0], end=prices_bt.index[-1])
-# 2. 날짜 정렬 일치
+# ------------------------
+# Equal Weight 벤치마크 전략
+# ------------------------
+benchmark_price = bt.get(tickers, start=prices_bt.index[0], end=prices_bt.index[-1])
 common_idx = prices_bt.index.intersection(benchmark_price.index)
 prices_bt = prices_bt.loc[common_idx]
 benchmark_price = benchmark_price.loc[common_idx]
 weights_bt = weights_bt.loc[common_idx]
 
-# 3. 전략 정의 (이미 test_bt 있음)
-benchmark_bt = bt.Backtest(
-    bt.Strategy('SPY',
-        [
-            bt.algos.RunOnce(),
-            bt.algos.SelectAll(),
-            bt.algos.WeighEqually(),
-            bt.algos.Rebalance()
-        ]
-    ),
-    benchmark_price
+strategy_equal_weight = bt.Strategy(
+    'Equal_Weight',
+    [
+        bt.algos.RunMonthly(),
+        bt.algos.SelectAll(),
+        bt.algos.WeighEqually(),
+        bt.algos.Rebalance()
+    ]
 )
+benchmark_bt = bt.Backtest(strategy_equal_weight, benchmark_price)
 
-# 4. 실행 및 비교
-result = bt.run(test_bt, benchmark_bt)
+# ------------------------
+# SPY 벤치마크 전략
+# ------------------------
+benchmark_price2 = bt.get('SPY', start=prices_bt.index[0], end=prices_bt.index[-1])
+common_idx = prices_bt.index.intersection(benchmark_price2.index)
+prices_bt = prices_bt.loc[common_idx]
+benchmark_price2 = benchmark_price2.loc[common_idx]
+weights_bt = weights_bt.loc[common_idx]
+
+strategy_spy = bt.Strategy(
+    'SPY_Benchmark',
+    [
+        bt.algos.RunOnce(),
+        bt.algos.SelectAll(),
+        bt.algos.WeighEqually(),
+        bt.algos.Rebalance()
+    ]
+)
+benchmark_bt2 = bt.Backtest(strategy_spy, benchmark_price2)
+
+# ------------------------
+# 실행 및 결과 비교
+# ------------------------
+result = bt.run(test_bt, benchmark_bt, benchmark_bt2)
 result.display()
 result.plot()
-
