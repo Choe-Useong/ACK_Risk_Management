@@ -188,6 +188,63 @@ def shrink_mean(
     return out
 
 
+def shrink_mean(
+    mu_df: pd.DataFrame,
+    var_df: pd.DataFrame | None = None,
+    lam: float = 0.0,
+    method: str = 'manual'
+) -> pd.DataFrame:
+    """
+    mu_df  : T×N 칼만 필터로 추정된 기대수익
+    var_df : T×N 칼만 필터 사후분산 (P_{ii,t|t} 대각 성분) — method='auto'일 때 필수
+    lam    : manual 모드에서 쓸 λ
+    method : 'manual' 또는 'auto'
+    
+    auto 모드에서는 ν=0 target, p-2 공식 Strict Stein 적용
+    """
+    # ───────────────────────────────────────── manual 모드 ─────
+    if method == 'manual':
+        mean_s = mu_df.mean(axis=1)
+        return mu_df.mul(1 - lam, axis=0).add(mean_s.mul(lam), axis=0)
+
+    # ───────────────────────────────────────── auto 모드 ──────
+    if method == 'auto':
+        if var_df is None:
+            raise ValueError("method='auto'일 때는 var_df를 반드시 넘겨주세요.")
+        
+        # 인덱스·칼럼 정렬
+        var_df = var_df.reindex(mu_df.index)[mu_df.columns]
+
+        T, N = mu_df.shape
+        out  = pd.DataFrame(index=mu_df.index, columns=mu_df.columns, dtype=float)
+
+        # ν=0 벡터 (Series)
+        zero_target = pd.Series(0.0, index=mu_df.columns)
+
+        for t in range(T):
+            mu_t = mu_df.iloc[t]
+
+            # — 1) σ_i = √var_t_series
+            var_t_series = var_df.iloc[t].astype(float)
+            sigma        = np.sqrt(var_t_series.clip(lower=1e-12))
+
+            # — 2) 표준화 (nu=0 이므로 그냥 mu_t/sigma)
+            z      = mu_t / sigma
+            Q      = max((z**2).sum(), 1e-6)  # Q_t
+
+            # — 3) Strict Stein λ = max(0, 1 - (p-2)/Q)
+            lam_opt = max(0.0, 1 - (N - 2) / Q)
+
+            # — 4) ν=0 으로 수축: out = (1-lam)*mu_t
+            out.iloc[t] = (1 - lam_opt) * mu_t
+
+        return out
+
+    # 그 외 잘못된 method
+    raise ValueError("method는 'manual' 또는 'auto'만 가능합니다.")
+
+
+
 
 def constant_correlation_target(S):
     std = np.sqrt(np.diag(S))
