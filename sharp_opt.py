@@ -472,19 +472,19 @@ mu_shrunk= mu_shrunk.dropna()
 
 
 # 3. 확장 DCC-GARCH 공분산
-#dcc_cov_series = rolling_dcc_garch(log_returns, window=500, step=25, dist='t')
+dcc_cov_series = rolling_dcc_garch(log_returns, window=252, step=25, dist='t')
 
 # 4. mu_shrunk와 날짜 맞춤
-#mu_for_opt = mu_shrunk.loc[dcc_cov_series.index]
+mu_for_opt = mu_shrunk.loc[dcc_cov_series.index]
 
 cov_series = ewma_cov_with_initial_sample(log_returns, lam=0.94)
 
 
-sharpe_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='sharpe', ridge= 0.1)
+#sharpe_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='sharpe', ridge= 0.1)
 kelly_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='kelly', ridge= 0.0)
 
 # 5. Kelly / Sharpe 최적화
-#sharpe_weights_dcc = rolling_portfolio_weights(mu_for_opt, list(dcc_cov_series), objective='sharpe', ridge=0.1)
+sharpe_weights = rolling_portfolio_weights(mu_for_opt, list(dcc_cov_series), objective='sharpe', ridge=0.1)
 
 import bt
 from bt.algos import Or, RunOnce, RunIfOutOfBounds
