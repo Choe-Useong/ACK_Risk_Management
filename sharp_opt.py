@@ -95,56 +95,6 @@ def estimate_dynamic_mu(
 
 
 
-'''
-def shrink_mean(
-    mu_df: pd.DataFrame,
-    var_df: pd.DataFrame | None = None,
-    lam: float = 0.0,
-    method: str = 'manual'
-) -> pd.DataFrame:
-    """
-    mu_df  : T×N 예상 수익(칼만필터로 추정된 μ)
-    var_df : T×N posterior state covariance (res.filtered_state_cov 대각 평균)
-             method='auto'일 때 필수
-    lam    : manual 모드에서 쓸 λ
-    method : 'manual' 또는 'auto'
-    """
-    # 1) manual 모드: 기존대로
-    if method == 'manual':
-        mean_s = mu_df.mean(axis=1)
-        return mu_df.mul(1 - lam, axis=0).add(mean_s.mul(lam), axis=0)
-
-    # 2) auto 모드: posterior covariance(var_df) 사용
-    if var_df is None:
-        raise ValueError("method='auto'일 때는 var_df(posterior covariance)를 넘겨주세요.")
-    # 인덱스·칼럼 정렬
-    var_df = var_df.reindex(mu_df.index)[mu_df.columns]
-
-    T, N = mu_df.shape
-    out  = pd.DataFrame(index=mu_df.index, columns=mu_df.columns, dtype=float)
-
-    for t in range(T):
-        mu_t   = mu_df.iloc[t]
-        mu_bar = mu_t.mean()
-        # posterior covariance: 각 자산 state 추정 오차분산의 평균
-        var_t  = var_df.iloc[t].mean()
-        # 횡단면 편차 제곱합
-        diff2  = ((mu_t - mu_bar) ** 2).sum()
-        diff2  = max(diff2, 1e-6)
-        # James–Stein λ: (N-3)*Q / diff2
-        lam_opt = ((N - 3) * var_t) / diff2
-        lam_opt = np.clip(lam_opt, 0, 1)
-
-        out.iloc[t] = (1 - lam_opt) * mu_t + lam_opt * mu_bar
-
-    return out
-'''
-
-
-
-
-
-
 
 
 
@@ -199,64 +149,6 @@ def shrink_mean(
 
 
 
-'''
-
-def shrink_mean(
-    mu_df: pd.DataFrame,
-    var_df: pd.DataFrame | None = None,
-    lam: float = 0.0,
-    method: str = 'manual'
-) -> pd.DataFrame:
-    """
-    mu_df  : T×N 칼만 필터로 추정된 기대수익
-    var_df : T×N 칼만 필터 사후분산 (P_{ii,t|t} 대각 성분) — method='auto'일 때 필수
-    lam    : manual 모드에서 쓸 λ
-    method : 'manual' 또는 'auto'
-    
-    auto 모드에서는 ν=0 target, p-2 공식 Strict Stein 적용
-    """
-    # ───────────────────────────────────────── manual 모드 ─────
-    if method == 'manual':
-        mean_s = mu_df.mean(axis=1)
-        return mu_df.mul(1 - lam, axis=0).add(mean_s.mul(lam), axis=0)
-
-    # ───────────────────────────────────────── auto 모드 ──────
-    if method == 'auto':
-        if var_df is None:
-            raise ValueError("method='auto'일 때는 var_df를 반드시 넘겨주세요.")
-        
-        # 인덱스·칼럼 정렬
-        var_df = var_df.reindex(mu_df.index)[mu_df.columns]
-
-        T, N = mu_df.shape
-        out  = pd.DataFrame(index=mu_df.index, columns=mu_df.columns, dtype=float)
-
-        # ν=0 벡터 (Series)
-        zero_target = pd.Series(0.0, index=mu_df.columns)
-
-        for t in range(T):
-            mu_t = mu_df.iloc[t]
-
-            # — 1) σ_i = √var_t_series
-            var_t_series = var_df.iloc[t].astype(float)
-            sigma        = np.sqrt(var_t_series.clip(lower=1e-12))
-
-            # — 2) 표준화 (nu=0 이므로 그냥 mu_t/sigma)
-            z      = mu_t / sigma
-            Q      = max((z**2).sum(), 1e-6)  # Q_t
-
-            # — 3) Strict Stein λ = max(0, 1 - (p-2)/Q)
-            lam_opt = max(0.0, 1 - (N - 2) / Q)
-
-            # — 4) ν=0 으로 수축: out = (1-lam)*mu_t
-            out.iloc[t] = (1 - lam_opt) * mu_t
-
-        return out
-
-    # 그 외 잘못된 method
-    raise ValueError("method는 'manual' 또는 'auto'만 가능합니다.")
-
-'''
 
 
 def constant_correlation_target(S):
@@ -308,108 +200,62 @@ def subtract_risk_free_from_mu(
     return mu_excess_df
 
 
-
-
-
-def ewma_shrink_cov(returns_df, lam=0.94, shrink_lambda=0.0):
-    T, N = returns_df.shape
-    S = returns_df.cov().values
-    cov_list = []
-    for t in range(T):
-        r = returns_df.iloc[t].values.reshape(-1, 1)
-        S = lam * S + (1 - lam) * (r @ r.T)
-        target = constant_correlation_target(S)
-        S_shrink = shrink_lambda * target + (1 - shrink_lambda) * S
-        cov_list.append(pd.DataFrame(S_shrink,
-                                     index=returns_df.columns,
-                                     columns=returns_df.columns))
-    return cov_list
-
-
-
-
-
-
 from mgarch import mgarch
 from tqdm import tqdm
 
+def rolling_dcc_garch(returns_df, window=252, step=25, dist='t'):
+    cov_list, idx_list = [], []
 
-def rolling_dcc_garch(returns_df, window=500, step=5, dist='t'):
-    cov_list = []
-    idx_list = []
+    T = len(returns_df)
+    if window >= T - 1:
+        raise ValueError("window는 전체 길이-1보다 작아야 1스텝 앞 예측 라벨링이 가능합니다.")
 
-    start = window
-    end_total = len(returns_df)
-
-    # 초기 fit
+    # ── 초기 fit: [0, window)로 적합 ──────────────────────────
     model = mgarch(dist=dist)
     model.fit(returns_df.iloc[:window].values)
-    last_date_idx = window - 1
 
-    # 첫 예측
-    pred = model.predict(1)
+    # ── 첫 예측: 정보시점=window-1 → 대상일=window 로 라벨 ────  (★오프바이원 수정)
+    pred  = model.predict(1)
     cov_t = pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns)
     cov_list.append(cov_t)
-    idx_list.append(returns_df.index[last_date_idx])
+    idx_list.append(returns_df.index[window])   # ← 기존: window-1 (잘못)
 
-    # step 간격 반복
-    for end in tqdm(range(window, end_total), desc="Rolling DCC-GARCH Daily Fit", unit="day"):
-        # step 주기마다 모델 재학습
-        if (end - window) % step == 0:
-            sub_data = returns_df.iloc[end - window:end].values
+    # ── 메인 루프: end = window .. T-2 (항상 end+1이 대상일) ───── (★루프 범위 조정)
+    for end in tqdm(range(window, T - 1), desc="Rolling DCC-GARCH Daily Fit", unit="day"):
+        # 1) 주기적 리핏: 윈도우 [end-window+1, end]로 재적합
+        if ((end - window + 1) % step) == 0:
+            start = end - window + 1
+            sub_data = returns_df.iloc[start:end+1].values
             model = mgarch(dist=dist)
             model.fit(sub_data)
-            print(f"[DEBUG] Model refitted on rows {end-window} ~ {end-1}")
+            print(f"[DEBUG] Model refitted on rows {start} ~ {end}")
 
-        # 오늘 예측값 추가
-        pred = model.predict(1)
+        # 2) 리핏 사이 ‘일별 업데이트’ 수행 → 없으면 일일 리핏으로 폴백 (★계단현상 제거)
+        updated = False
+        y_t = returns_df.iloc[end].values
+        for attr in ("update_one", "update", "filter_one", "filter"):
+            if hasattr(model, attr):
+                try:
+                    getattr(model, attr)(y_t)
+                    updated = True
+                    break
+                except TypeError:
+                    pass
+        if not updated and ((end - window + 1) % step) != 0:
+            # 폴백: 리핏 없는 날에도 마지막 window로 재적합
+            start = end - window + 1
+            sub_data = returns_df.iloc[start:end+1].values
+            model = mgarch(dist=dist)
+            model.fit(sub_data)
+
+        # 3) t+1 대상 예측 생성 및 라벨을 target(day+1)로 기록
+        pred  = model.predict(1)
         cov_t = pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns)
         cov_list.append(cov_t)
-        idx_list.append(returns_df.index[end])
+        idx_list.append(returns_df.index[end + 1])  # ← 기존: end (as-of 라벨)
 
-    return pd.Series(cov_list, index=idx_list)
+    return pd.Series(cov_list, index=idx_list, dtype=object)
 
-
-
-
-
-
-def ewma_cov_with_initial_sample(returns_df: pd.DataFrame, lam: float = 0.94, init_window: int = 25) -> list[pd.DataFrame]:
-    """
-    초기 25개 샘플로 공분산 초기화 후, 이후 EWMA로 누수 없이 시점별 공분산 추정
-
-    Parameters
-    ----------
-    returns_df : pd.DataFrame
-        수익률 데이터프레임 (T x N)
-    lam : float
-        EWMA lambda 계수 (default=0.94)
-    init_window : int
-        초기 샘플 공분산을 계산할 관측치 수 (default=25)
-
-    Returns
-    -------
-    cov_list : list[pd.DataFrame]
-        시점별 공분산 추정값 리스트
-    """
-    T, N = returns_df.shape
-    cov_list = []
-
-    # 1. 초기화 구간보다 짧으면 계산 불가
-    if T < init_window:
-        raise ValueError("init_window보다 데이터 길이가 더 길어야 합니다.")
-
-    # 2. 초기 공분산: 첫 25개 샘플로 계산
-    S = returns_df.iloc[:init_window].cov().values
-
-    # 3. init_window 시점부터 EWMA 재귀 시작
-    for t in range(init_window, T):
-        r = returns_df.iloc[t].values.reshape(-1, 1)
-        S = lam * S + (1 - lam) * (r @ r.T)
-        cov_df = pd.DataFrame(S, index=returns_df.columns, columns=returns_df.columns)
-        cov_list.append(cov_df)
-
-    return cov_list
 
 
 
@@ -448,51 +294,6 @@ def optimize_weights(mu, cov, objective='sharpe', ridge=1e-3, sum_to_one=True):
 
     res = minimize(obj, w0, method='SLSQP', bounds=bounds, constraints=cons)
     return pd.Series(res.x if res.success else np.full(N, np.nan), index=mu.index)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -546,9 +347,6 @@ dcc_cov_series = rolling_dcc_garch(log_returns, window=252, step=25, dist='t')
 
 # 4. mu_shrunk와 날짜 맞춤
 mu_for_opt = mu_shrunk.loc[dcc_cov_series.index]
-
-cov_series = ewma_cov_with_initial_sample(log_returns, lam=0.94)
-
 
 #sharpe_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='sharpe', ridge= 0.1)
 #kelly_weights = rolling_portfolio_weights(mu_shrunk, cov_series, objective='kelly', ridge= 0.0)
