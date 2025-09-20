@@ -200,61 +200,67 @@ def subtract_risk_free_from_mu(
     return mu_excess_df
 
 
-from mgarch import mgarch
+from my_mgarch import mgarch
 from tqdm import tqdm
 
-def rolling_dcc_garch(returns_df, window=252, step=25, dist='t'):
-    cov_list, idx_list = [], []
-
-    T = len(returns_df)
+def rolling_dcc_garch(
+    returns_df: pd.DataFrame,
+    mean_df: pd.DataFrame | None = None,   # ← (선택) 하루 앞 평균예측 m_{t|t-1} 소스
+    window: int = 252,
+    step: int = 25,
+    dist: str = 'norm',
+    label: str = 'target'                  # 'target'이면 t+1 날짜에 라벨
+) -> pd.Series:
+    """
+    반환: pd.Series[target_date] of (N×N) 공분산 DataFrame.
+    - 25일마다: 최근 252일로 model.fit(...)  → 파라미터 갱신
+    - 그 사이: model.update_one(r_t, mean_pred) → 상태 갱신 후 t+1 공분산
+    """
+    if returns_df.isna().any().any():
+        raise ValueError("returns_df에 NaN이 있으면 업데이트가 불안정합니다. 사전 처리하세요.")
+    cols = list(returns_df.columns)
+    T, N = len(returns_df), len(cols)
     if window >= T - 1:
-        raise ValueError("window는 전체 길이-1보다 작아야 1스텝 앞 예측 라벨링이 가능합니다.")
+        raise ValueError("window는 전체 길이-1보다 작아야 합니다.")
 
-    # ── 초기 fit: [0, window)로 적합 ──────────────────────────
+    # ── 평균예측 소스 준비(정보누수 방지: 반드시 1일 시프트해서 씀) ─────────
+    if mean_df is not None:
+        # mean_df는 t 시점 추정치이므로 t+1 예측에 쓰려면 1일 시프트
+        mean_src = mean_df.shift(1).reindex(returns_df.index)
+    else:
+        mean_src = None
+
+    # ── 초기 적합: [0, window) → 상태 초기화 ───────────────────────────────
     model = mgarch(dist=dist)
     model.fit(returns_df.iloc[:window].values)
 
-    # ── 첫 예측: 정보시점=window-1 → 대상일=window 로 라벨 ────  (★오프바이원 수정)
-    pred  = model.predict(1)
-    cov_t = pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns)
-    cov_list.append(cov_t)
-    idx_list.append(returns_df.index[window])   # ← 기존: window-1 (잘못)
+    cov_list, idx_list = [], []
 
-    # ── 메인 루프: end = window .. T-2 (항상 end+1이 대상일) ───── (★루프 범위 조정)
-    for end in tqdm(range(window, T - 1), desc="Rolling DCC-GARCH Daily Fit", unit="day"):
-        # 1) 주기적 리핏: 윈도우 [end-window+1, end]로 재적합
-        if ((end - window + 1) % step) == 0:
-            start = end - window + 1
-            sub_data = returns_df.iloc[start:end+1].values
+    # 첫 예측: 정보시점 = window-1 → 대상일 = window
+    first_pred = model.predict(1)
+    H = np.asarray(first_pred['cov'], dtype=float)
+    cov_list.append(pd.DataFrame(H, index=cols, columns=cols))
+    idx_list.append(returns_df.index[window] if label == 'target' else returns_df.index[window-1])
+
+    # ── 메인 루프: t = window .. T-2  (항상 t+1을 예측·라벨링) ───────────────
+    for t in tqdm(range(window, T - 1), desc="Rolling DCC-GARCH (fit 25d, daily update)", unit="day"):
+        # 1) 25일마다 파라미터 재적합(롤링 252일)
+        if ((t - window + 1) % step) == 0:
+            start = t - window + 1
+            sub = returns_df.iloc[start:t+1].values
             model = mgarch(dist=dist)
-            model.fit(sub_data)
-            print(f"[DEBUG] Model refitted on rows {start} ~ {end}")
+            model.fit(sub)
 
-        # 2) 리핏 사이 ‘일별 업데이트’ 수행 → 없으면 일일 리핏으로 폴백 (★계단현상 제거)
-        updated = False
-        y_t = returns_df.iloc[end].values
-        for attr in ("update_one", "update", "filter_one", "filter"):
-            if hasattr(model, attr):
-                try:
-                    getattr(model, attr)(y_t)
-                    updated = True
-                    break
-                except TypeError:
-                    pass
-        if not updated and ((end - window + 1) % step) != 0:
-            # 폴백: 리핏 없는 날에도 마지막 window로 재적합
-            start = end - window + 1
-            sub_data = returns_df.iloc[start:end+1].values
-            model = mgarch(dist=dist)
-            model.fit(sub_data)
+        # 2) 오늘 관측 r_t와 평균예측 m_{t|t-1}로 상태 업데이트 → H_{t+1|t}
+        r_t = returns_df.iloc[t].values
+        m_t = None if mean_src is None else mean_src.iloc[t].values
+        pred = model.update_one(r_t, mean_pred=m_t)
+        H_next = np.asarray(pred['cov'], dtype=float)
 
-        # 3) t+1 대상 예측 생성 및 라벨을 target(day+1)로 기록
-        pred  = model.predict(1)
-        cov_t = pd.DataFrame(pred['cov'], index=returns_df.columns, columns=returns_df.columns)
-        cov_list.append(cov_t)
-        idx_list.append(returns_df.index[end + 1])  # ← 기존: end (as-of 라벨)
+        cov_list.append(pd.DataFrame(H_next, index=cols, columns=cols))
+        idx_list.append(returns_df.index[t+1] if label == 'target' else returns_df.index[t])
 
-    return pd.Series(cov_list, index=idx_list, dtype=object)
+    return pd.Series(cov_list, index=pd.Index(idx_list, name=label), dtype=object)
 
 
 
@@ -339,7 +345,6 @@ mu_shrunk = shrink_mean(mu_df, var_df=var_df, method='auto')
 
 mu_shrunk.iloc[:25] = np.nan
 mu_shrunk= mu_shrunk.dropna()
-
 
 
 # 3. 확장 DCC-GARCH 공분산
